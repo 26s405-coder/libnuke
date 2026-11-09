@@ -44,3 +44,21 @@ func TestRunClosesItemsAfterCanceledListerFinishes(t *testing.T) {
 		t.Fatal("scanner item channel was not closed after the lister finished")
 	}
 }
+
+func TestRunReturnsErrorWhenContextIsAlreadyCanceled(t *testing.T) {
+	registry.ClearRegistry()
+	registry.Register(testResourceRegistration)
+
+	s, err := New(&Config{
+		Owner:           "owner",
+		ResourceTypes:   []string{testResourceType},
+		ParallelQueries: 1,
+	})
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = s.Run(ctx)
+	assert.ErrorIs(t, err, context.Canceled)
+}

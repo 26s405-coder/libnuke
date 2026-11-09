@@ -128,7 +128,23 @@ func (s *Scanner) Run(ctx context.Context) error {
 	var runErr error
 
 	for _, resourceType := range s.ResourceTypes {
+		// Semaphore.Acquire may succeed immediately even when ctx is already
+		// canceled if capacity is available. Check cancellation explicitly so
+		// callers always receive the context error instead of starting a lister.
+		if err := ctx.Err(); err != nil {
+			runErr = err
+			break
+		}
+
 		if err := s.semaphore.Acquire(ctx, 1); err != nil {
+			runErr = err
+			break
+		}
+
+		// The context can be canceled between the first check and a successful
+		// non-blocking acquire. Return the acquired permit before stopping.
+		if err := ctx.Err(); err != nil {
+			s.semaphore.Release(1)
 			runErr = err
 			break
 		}
