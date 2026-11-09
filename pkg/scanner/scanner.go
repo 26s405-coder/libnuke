@@ -43,9 +43,9 @@ type Scanner struct {
 	Options         interface{}
 	Owner           string
 	mutateOptsFunc  MutateOptsFunc `hash:"ignore"`
-	parallelQueries   int64
+	parallelQueries    int64
 	globalQueryLimiter QueryLimiter `hash:"ignore"`
-	logger            *logrus.Logger
+	logger             *logrus.Logger
 }
 
 // MutateOptsFunc is a function that can mutate the Options for a given resource type. This is useful for when you
