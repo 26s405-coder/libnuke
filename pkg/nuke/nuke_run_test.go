@@ -110,7 +110,7 @@ func Test_Nuke_Run_ScanError(t *testing.T) {
 	n.SetLogger(logrus.WithField("test", true))
 	n.SetRunSleep(time.Millisecond * 5)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	registry.ClearRegistry()
@@ -129,8 +129,11 @@ func Test_Nuke_Run_ScanError(t *testing.T) {
 	scannerErr := n.RegisterScanner(testScope, s)
 	assert.NoError(t, scannerErr)
 
+	// Cancel explicitly so this test does not depend on a 1ns timer
+	// racing with scanner startup.
+	cancel()
 	runErr := n.Run(ctx)
-	assert.Error(t, runErr)
+	assert.ErrorIs(t, runErr, context.Canceled)
 }
 
 // Test_NukeRunSimpleWithFirstPromptError tests the first prompt throwing an error
