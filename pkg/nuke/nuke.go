@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 
 	liberrors "github.com/ekristen/libnuke/pkg/errors"
 	"github.com/ekristen/libnuke/pkg/scanner"
@@ -25,6 +26,77 @@ import (
 
 // ListCache is used to cache the list of resources that are returned from the API.
 type ListCache map[string]map[string][]resource.Resource
+
+// waitResourceIndex accelerates wait checks for resource types whose complete
+// result set implements UniqueKeyGetter. Mixed/legacy result sets retain the
+// original equality scan to preserve matching semantics.
+type waitResourceIndex struct {
+	byKey    map[string][]resource.Resource
+	complete bool
+}
+
+type waitCacheIndex map[string]map[string]waitResourceIndex
+
+func buildWaitResourceIndex(resources []resource.Resource) waitResourceIndex {
+	index := waitResourceIndex{
+		byKey:    make(map[string][]resource.Resource, len(resources)),
+		complete: true,
+	}
+
+	for _, r := range resources {
+		getter, ok := r.(resource.UniqueKeyGetter)
+		if !ok {
+			index.complete = false
+			continue
+		}
+
+		key := getter.UniqueKey()
+		index.byKey[key] = append(index.byKey[key], r)
+	}
+
+	return index
+}
+
+// queueStateCounts maintains per-type state counts during one HandleQueue pass.
+type queueStateCounts map[string]map[queue.ItemState]int
+
+func newQueueStateCounts(items []*queue.Item) queueStateCounts {
+	counts := make(queueStateCounts)
+	for _, item := range items {
+		byState, ok := counts[item.Type]
+		if !ok {
+			byState = make(map[queue.ItemState]int)
+			counts[item.Type] = byState
+		}
+		byState[item.GetState()]++
+	}
+
+	return counts
+}
+
+func (c queueStateCounts) move(resourceType string, from, to queue.ItemState) {
+	if c == nil || from == to {
+		return
+	}
+
+	byState, ok := c[resourceType]
+	if !ok {
+		byState = make(map[queue.ItemState]int)
+		c[resourceType] = byState
+	}
+
+	byState[from]--
+	byState[to]++
+}
+
+func (c queueStateCounts) countByType(resourceType string, states ...queue.ItemState) int {
+	byState := c[resourceType]
+	count := 0
+	for _, state := range states {
+		count += byState[state]
+	}
+	return count
+}
 
 // Parameters is a collection of common variables used to configure the before of the Nuke instance.
 type Parameters struct {
@@ -86,6 +158,7 @@ type Nuke struct {
 	version       string        // version is what is shown at the beginning of a run
 	log           *logrus.Entry // log is the logger that is used for the library
 	runSleep      time.Duration // runSleep is how long to sleep between runs of the queue
+	queryLimiter  *semaphore.Weighted
 
 	failedCount  int // failedCount is used to track how many times we've retried all failed resources
 	waitingCount int // waitingCount is used to track how many times we've waiting for resources to move states
@@ -101,8 +174,9 @@ func New(params *Parameters, filters filter.Filters, settings *libsettings.Setti
 		Filters:    filters,
 		Queue:      queue.New(),
 		Settings:   settings,
-		log:        logger.WithField("component", "nuke"),
-		runSleep:   5 * time.Second,
+		log:          logger.WithField("component", "nuke"),
+		runSleep:     5 * time.Second,
+		queryLimiter: semaphore.NewWeighted(scanner.DefaultParallelQueries),
 	}
 
 	if n.Settings == nil {
@@ -168,6 +242,9 @@ func (n *Nuke) RegisterScanner(scope registry.Scope, instance *scanner.Scanner) 
 	}
 
 	n.scannerHashes = append(n.scannerHashes, hashString)
+	if n.queryLimiter != nil {
+		instance.SetGlobalQueryLimiter(n.queryLimiter)
+	}
 	n.Scanners[scope] = append(n.Scanners[scope], instance)
 
 	return nil
@@ -385,54 +462,116 @@ func (n *Nuke) getScanners() []*scanner.Scanner {
 	return allScanners
 }
 
-// runScanner is used to run a scanner and process the items that are returned from the scanner
+// processScannerItem applies the same queue setup and filtering to one scanned resource.
+func (n *Nuke) processScannerItem(item *queue.Item, itemQueue *queue.Queue) error {
+	// Experimental Feature
+	if n.Parameters.WaitOnDependencies {
+		reg := registry.GetRegistration(item.Type)
+		if len(reg.DependsOn) > 0 {
+			item.State = queue.ItemStateNewDependency
+		}
+	}
+
+	sGetter, ok := item.Resource.(resource.SettingsGetter)
+	if ok {
+		sGetter.Settings(n.Settings.Get(item.Type))
+	}
+
+	itemQueue.Items = append(itemQueue.Items, item)
+	if err := n.Filter(item); err != nil {
+		return err
+	}
+
+	// If quiet and filtered, skip printing to screen
+	if n.Parameters.Quiet && item.State == queue.ItemStateFiltered {
+		return nil
+	}
+
+	item.Print()
+	return nil
+}
+
+// runScanner is used to run a scanner and process the items that are returned from the scanner.
 func (n *Nuke) runScanner(ctx context.Context, resourceScanner *scanner.Scanner, itemQueue *queue.Queue) error {
 	if err := resourceScanner.Run(ctx); err != nil {
 		return err
 	}
 
 	for item := range resourceScanner.Items {
-		// Experimental Feature
-		if n.Parameters.WaitOnDependencies {
-			reg := registry.GetRegistration(item.Type)
-			if len(reg.DependsOn) > 0 {
-				item.State = queue.ItemStateNewDependency
-			}
-		}
-
-		sGetter, ok := item.Resource.(resource.SettingsGetter)
-		if ok {
-			sGetter.Settings(n.Settings.Get(item.Type))
-		}
-
-		itemQueue.Items = append(itemQueue.Items, item)
-		if err := n.Filter(item); err != nil {
+		if err := n.processScannerItem(item, itemQueue); err != nil {
 			return err
 		}
-
-		// If quiet and filtered, skip printing to screen
-		if n.Parameters.Quiet && item.State == queue.ItemStateFiltered {
-			continue
-		}
-
-		item.Print()
 	}
 
 	return nil
 }
 
-// Scan is used to scan for resources. It will run the scanners that were registered with the library by the invoking
-// tool. It will also filter the resources based on the filters that were registered. It will also print the current
-// status of the resources.
+// Scan runs registered scanners concurrently while consuming their results in
+// registration order. All scanners share one query limiter, so parallel
+// regions/accounts cannot multiply the overall List-call concurrency.
 func (n *Nuke) Scan(ctx context.Context) error {
 	itemQueue := queue.New()
 
 	scanners := n.getScanners()
 
-	// Iterate over scanners and run them then process their items.
-	for _, actualScanner := range scanners {
-		if err := n.runScanner(ctx, actualScanner, itemQueue); err != nil {
-			return err
+	if len(scanners) <= 1 {
+		for _, actualScanner := range scanners {
+			if err := n.runScanner(ctx, actualScanner, itemQueue); err != nil {
+				return err
+			}
+		}
+	} else {
+		scanCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		doneChans := make([]chan error, len(scanners))
+		finished := make([]bool, len(scanners))
+
+		for i, actualScanner := range scanners {
+			doneChans[i] = make(chan error, 1)
+			go func(done chan<- error, current *scanner.Scanner) {
+				done <- current.Run(scanCtx)
+			}(doneChans[i], actualScanner)
+		}
+
+		stopAndWait := func() {
+			cancel()
+			for i, done := range doneChans {
+				if !finished[i] {
+					<-done
+					finished[i] = true
+				}
+			}
+		}
+
+		for i, actualScanner := range scanners {
+			items := (<-chan *queue.Item)(actualScanner.Items)
+			done := (<-chan error)(doneChans[i])
+
+			for items != nil || done != nil {
+				select {
+				case item, ok := <-items:
+					if !ok {
+						items = nil
+						continue
+					}
+
+					if err := n.processScannerItem(item, itemQueue); err != nil {
+						stopAndWait()
+						return err
+					}
+				case err := <-done:
+					done = nil
+					finished[i] = true
+					if err != nil {
+						stopAndWait()
+						return err
+					}
+				case <-ctx.Done():
+					stopAndWait()
+					return ctx.Err()
+				}
+			}
 		}
 	}
 
@@ -560,27 +699,43 @@ func (n *Nuke) filterWithoutGroups(item *queue.Item) error {
 // HandleQueue is used to handle the queue of resources. It will iterate over the queue and trigger the appropriate
 // handlers based on the state of the resource.
 func (n *Nuke) HandleQueue(ctx context.Context) {
-	listCache := make(map[string]map[string][]resource.Resource)
+	listCache := make(ListCache)
+	waitIndexes := make(waitCacheIndex)
+
+	var stateCounts queueStateCounts
+	if n.Parameters.WaitOnDependencies {
+		stateCounts = newQueueStateCounts(n.Queue.GetItems())
+	}
 
 	for _, item := range n.Queue.GetItems() {
+		beforeState := item.GetState()
+
 		switch item.GetState() {
 		case queue.ItemStateNew, queue.ItemStateHold:
 			n.HandleRemove(ctx, item)
 			item.Print()
 		case queue.ItemStateNewDependency, queue.ItemStatePendingDependency:
-			n.HandleWaitDependency(ctx, item)
+			if stateCounts != nil {
+				n.handleWaitDependency(ctx, item, stateCounts)
+			} else {
+				n.HandleWaitDependency(ctx, item)
+			}
 			item.Print()
 		case queue.ItemStateFailed:
 			n.HandleRemove(ctx, item)
-			n.HandleWait(ctx, item, listCache)
+			n.handleWait(ctx, item, listCache, waitIndexes)
 			item.Print()
 		case queue.ItemStatePending:
-			n.HandleWait(ctx, item, listCache)
+			n.handleWait(ctx, item, listCache, waitIndexes)
 			item.State = queue.ItemStateWaiting
 			item.Print()
 		case queue.ItemStateWaiting:
-			n.HandleWait(ctx, item, listCache)
+			n.handleWait(ctx, item, listCache, waitIndexes)
 			item.Print()
+		}
+
+		if stateCounts != nil {
+			stateCounts.move(item.Type, beforeState, item.GetState())
 		}
 	}
 
@@ -631,14 +786,26 @@ func (n *Nuke) HandleRemove(ctx context.Context, item *queue.Item) {
 // HandleWaitDependency is used to handle the waiting of a resource. It will check if the resource has any dependencies
 // and if it does, it will check if the dependencies have been removed. If they have, it will trigger the remove handler.
 func (n *Nuke) HandleWaitDependency(ctx context.Context, item *queue.Item) {
+	n.handleWaitDependency(ctx, item, nil)
+}
+
+func (n *Nuke) handleWaitDependency(ctx context.Context, item *queue.Item, counts queueStateCounts) {
 	reg := registry.GetRegistration(item.Type)
 	depCount := 0
+	activeStates := []queue.ItemState{
+		queue.ItemStateNew, queue.ItemStateNewDependency,
+		queue.ItemStatePending, queue.ItemStatePendingDependency,
+		queue.ItemStateWaiting, queue.ItemStateHold,
+	}
+
 	for _, dep := range reg.DependsOn {
-		cnt := n.Queue.CountByType(dep,
-			queue.ItemStateNew, queue.ItemStateNewDependency,
-			queue.ItemStatePending, queue.ItemStatePendingDependency,
-			queue.ItemStateWaiting, queue.ItemStateHold)
-		depCount += cnt
+		var count int
+		if counts != nil {
+			count = counts.countByType(dep, activeStates...)
+		} else {
+			count = n.Queue.CountByType(dep, activeStates...)
+		}
+		depCount += count
 	}
 
 	if depCount == 0 {
@@ -653,6 +820,10 @@ func (n *Nuke) HandleWaitDependency(ctx context.Context, item *queue.Item) {
 // HandleWait is used to handle the waiting of a resource. It will check if the resource has been removed. If it has,
 // it will set the state of the resource to finished. If it has not, it will set the state of the resource to waiting.
 func (n *Nuke) HandleWait(ctx context.Context, item *queue.Item, cache ListCache) {
+	n.handleWait(ctx, item, cache, nil)
+}
+
+func (n *Nuke) handleWait(ctx context.Context, item *queue.Item, cache ListCache, indexes waitCacheIndex) {
 	var err error
 
 	waitHook, hookOk := item.Resource.(resource.HandleWaitHook)
@@ -671,8 +842,7 @@ func (n *Nuke) HandleWait(ctx context.Context, item *queue.Item, cache ListCache
 	}
 
 	ownerID := item.Owner
-	_, ok := cache[ownerID]
-	if !ok {
+	if _, ok := cache[ownerID]; !ok {
 		cache[ownerID] = make(map[string][]resource.Resource)
 	}
 
@@ -687,26 +857,62 @@ func (n *Nuke) HandleWait(ctx context.Context, item *queue.Item, cache ListCache
 		cache[ownerID][item.Type] = left
 	}
 
-	for _, r := range left {
-		if !item.Equals(r) {
-			continue
+	if indexes != nil {
+		byType, ok := indexes[ownerID]
+		if !ok {
+			byType = make(map[string]waitResourceIndex)
+			indexes[ownerID] = byType
 		}
 
-		rSet, okSet := r.(resource.SettingsGetter)
-		if okSet {
-			rSet.Settings(n.Settings.Get(item.Type))
+		index, ok := byType[item.Type]
+		if !ok {
+			index = buildWaitResourceIndex(left)
+			byType[item.Type] = index
 		}
 
-		checker, filterOk := r.(resource.Filter)
-		if filterOk {
-			if filterErr := checker.Filter(); filterErr != nil {
-				break
+		if getter, ok := item.Resource.(resource.UniqueKeyGetter); ok && index.complete {
+			for _, candidate := range index.byKey[getter.UniqueKey()] {
+				if n.handleWaitCandidate(ctx, item, candidate) {
+					return
+				}
 			}
-		}
 
-		return
+			// Every listed resource has a UniqueKey, so a missing key cannot match.
+			item.State = queue.ItemStateFinished
+			item.Reason = ""
+			return
+		}
+	}
+
+	for _, r := range left {
+		if n.handleWaitCandidate(ctx, item, r) {
+			return
+		}
 	}
 
 	item.State = queue.ItemStateFinished
 	item.Reason = ""
+}
+
+// handleWaitCandidate preserves the original equality, settings, and filter behavior.
+// It returns true when the candidate matched and no further list entries should be checked.
+func (n *Nuke) handleWaitCandidate(ctx context.Context, item *queue.Item, r resource.Resource) bool {
+	if !item.Equals(r) {
+		return false
+	}
+
+	rSet, okSet := r.(resource.SettingsGetter)
+	if okSet {
+		rSet.Settings(n.Settings.Get(item.Type))
+	}
+
+	checker, filterOk := r.(resource.Filter)
+	if filterOk {
+		if filterErr := checker.Filter(); filterErr != nil {
+			item.State = queue.ItemStateFinished
+			item.Reason = ""
+		}
+	}
+
+	return true
 }

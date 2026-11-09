@@ -26,6 +26,13 @@ const DefaultParallelQueries = 16
 // DefaultQueueSize is the default size of the item queue for a scanner.
 const DefaultQueueSize = 50000
 
+// QueryLimiter limits concurrent List calls across multiple scanners.
+// Implementations must allow concurrent Acquire and Release calls.
+type QueryLimiter interface {
+	Acquire(ctx context.Context, n int64) error
+	Release(n int64)
+}
+
 // Scanner is collection of resource types that will be scanned for existing resources and added to the
 // item queue for processing. These items will be filtered and then processed.
 type Scanner struct {
@@ -35,8 +42,9 @@ type Scanner struct {
 	Options         interface{}
 	Owner           string
 	mutateOptsFunc  MutateOptsFunc `hash:"ignore"`
-	parallelQueries int64
-	logger          *logrus.Logger
+	parallelQueries   int64
+	globalQueryLimiter QueryLimiter `hash:"ignore"`
+	logger            *logrus.Logger
 }
 
 // MutateOptsFunc is a function that can mutate the Options for a given resource type. This is useful for when you
@@ -106,6 +114,13 @@ func (s *Scanner) SetLogger(logger *logrus.Logger) {
 	s.logger = logger
 }
 
+// SetGlobalQueryLimiter sets an optional limiter shared by multiple scanners.
+// It is useful when scanners target different regions or accounts but must
+// share one overall API concurrency budget.
+func (s *Scanner) SetGlobalQueryLimiter(limiter QueryLimiter) {
+	s.globalQueryLimiter = limiter
+}
+
 // Run starts the scanner and runs the lister for each resource type.
 func (s *Scanner) Run(ctx context.Context) error {
 	for _, resourceType := range s.ResourceTypes {
@@ -156,6 +171,14 @@ func (s *Scanner) list(ctx context.Context, owner, resourceType string, opts int
 	}
 
 	logger.Debug("attempting to run lister")
+
+	if s.globalQueryLimiter != nil {
+		if err := s.globalQueryLimiter.Acquire(ctx, 1); err != nil {
+			logger.WithError(err).Debug("query canceled before listing")
+			return
+		}
+		defer s.globalQueryLimiter.Release(1)
+	}
 
 	rs, err := lister.List(ctx, opts)
 	if err != nil {
