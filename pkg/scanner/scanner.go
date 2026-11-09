@@ -147,10 +147,24 @@ func (s *Scanner) Run(ctx context.Context) error {
 
 	// Always join started listers before closing Items. This also makes the
 	// result channel safe to consume when scheduling is interrupted by ctx.
-	wg.Wait()
-	close(s.Items)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(s.Items)
+		close(done)
+	}()
 
-	return runErr
+	// Do not block cancellation on a lister that does not honor ctx. The
+	// channel is closed asynchronously, after every started lister has stopped.
+	select {
+	case <-done:
+		return runErr
+	case <-ctx.Done():
+		if runErr != nil {
+			return runErr
+		}
+		return ctx.Err()
+	}
 }
 
 func (s *Scanner) list(ctx context.Context, owner, resourceType string, opts interface{}) {
