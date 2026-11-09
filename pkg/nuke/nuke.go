@@ -872,7 +872,7 @@ func (n *Nuke) handleWait(ctx context.Context, item *queue.Item, cache ListCache
 
 		if getter, ok := item.Resource.(resource.UniqueKeyGetter); ok && index.complete {
 			for _, candidate := range index.byKey[getter.UniqueKey()] {
-				if n.handleWaitCandidate(ctx, item, candidate) {
+				if n.handleWaitCandidate(item, candidate) {
 					return
 				}
 			}
@@ -885,7 +885,7 @@ func (n *Nuke) handleWait(ctx context.Context, item *queue.Item, cache ListCache
 	}
 
 	for _, r := range left {
-		if n.handleWaitCandidate(ctx, item, r) {
+		if n.handleWaitCandidate(item, r) {
 			return
 		}
 	}
@@ -896,7 +896,7 @@ func (n *Nuke) handleWait(ctx context.Context, item *queue.Item, cache ListCache
 
 // handleWaitCandidate preserves the original equality, settings, and filter behavior.
 // It returns true when the candidate matched and no further list entries should be checked.
-func (n *Nuke) handleWaitCandidate(ctx context.Context, item *queue.Item, r resource.Resource) bool {
+func (n *Nuke) handleWaitCandidate(item *queue.Item, r resource.Resource) bool {
 	if !item.Equals(r) {
 		return false
 	}
