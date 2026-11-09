@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
@@ -123,9 +124,13 @@ func (s *Scanner) SetGlobalQueryLimiter(limiter QueryLimiter) {
 
 // Run starts the scanner and runs the lister for each resource type.
 func (s *Scanner) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	var runErr error
+
 	for _, resourceType := range s.ResourceTypes {
 		if err := s.semaphore.Acquire(ctx, 1); err != nil {
-			return err
+			runErr = err
+			break
 		}
 
 		opts := s.Options
@@ -133,17 +138,19 @@ func (s *Scanner) Run(ctx context.Context) error {
 			opts = s.mutateOptsFunc(opts, resourceType)
 		}
 
-		go s.list(ctx, s.Owner, resourceType, opts)
+		wg.Add(1)
+		go func(resourceType string, opts interface{}) {
+			defer wg.Done()
+			s.list(ctx, s.Owner, resourceType, opts)
+		}(resourceType, opts)
 	}
 
-	// Wait for all routines to finish.
-	if err := s.semaphore.Acquire(ctx, s.parallelQueries); err != nil {
-		return err
-	}
-
+	// Always join started listers before closing Items. This also makes the
+	// result channel safe to consume when scheduling is interrupted by ctx.
+	wg.Wait()
 	close(s.Items)
 
-	return nil
+	return runErr
 }
 
 func (s *Scanner) list(ctx context.Context, owner, resourceType string, opts interface{}) {
